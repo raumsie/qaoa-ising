@@ -18,13 +18,15 @@ Exactly two `scipy.optimize.minimize` methods are supported, selectable via
 
 Device selection
 -----------------
-`device="CPU"` (default) uses `qiskit.primitives.StatevectorEstimator`.
+`device="CPU"` (default) uses `qiskit.primitives.StatevectorEstimator`
+
 `device="GPU"` uses `qiskit_aer.primitives.EstimatorV2.from_backend(
 AerSimulator(method="statevector", device="GPU"))`.
 
-NOTE-TO-SELF: Colab uses CUDA 12 by default. qiskit-aer-gpu supposedly
-supports CUDA 12, but previous qiskit QAOA implementations needed to
-install CUDA 11.
+`device="CPU_AER"` uses the same Aer `EstimatorV2` code path as `"GPU"`,
+just with `AerSimulator(method="statevector", device="CPU")` instead of
+`device="GPU"`. It exists purely so a CPU-vs-GPU wall-clock comparison can
+hold the simulator engine fixed.
 
 Warm-start extension point
 ---------------------------
@@ -68,7 +70,12 @@ from scipy.optimize import minimize
 from src.qaoa_circuit import build_qaoa_circuit_for_instance, build_qaoa_circuit_from_ising
 
 VALID_OPTIMIZER_METHODS = ("COBYLA", "L-BFGS-B")
-VALID_DEVICES = ("CPU", "GPU")
+VALID_DEVICES = ("CPU", "GPU", "CPU_AER")
+
+# Devices that route through qiskit_aer's EstimatorV2.
+# Both need the ansatz decomposed first since Aer's EstimatorV2
+# can't resolve a `QAOAAnsatz`'s opaque `"QAOA"` instruction.
+AER_DEVICES = ("GPU", "CPU_AER")
 
 
 # --------------------------------------------------------------------------
@@ -82,9 +89,12 @@ def build_estimator(device: str = "CPU"):
     Parameters
     ----------
     device : str
-        `"CPU"` (default) -> `qiskit.primitives.StatevectorEstimator`.
+        `"CPU"` (default) -> `qiskit.primitives.StatevectorEstimator`
         `"GPU"` -> `qiskit_aer.primitives.EstimatorV2.from_backend(
         AerSimulator(method="statevector", device="GPU"))`.
+        `"CPU_AER"` -> `qiskit_aer.primitives.EstimatorV2.from_backend(
+        AerSimulator(method="statevector", device="CPU"))` -- same Aer
+        code path as `"GPU"`, just on CPU.
 
     Returns
     -------
@@ -99,6 +109,12 @@ def build_estimator(device: str = "CPU"):
 
         backend = AerSimulator(method="statevector", device="GPU")
         return AerEstimatorV2.from_backend(backend)
+    elif device == "CPU_AER":
+        from qiskit_aer import AerSimulator
+        from qiskit_aer.primitives import EstimatorV2 as AerEstimatorV2
+
+        backend = AerSimulator(method="statevector", device="CPU")
+        return AerEstimatorV2.from_backend(backend)
     else:
         raise ValueError(f"device must be one of {VALID_DEVICES}, got {device!r}")
 
@@ -106,13 +122,11 @@ def build_estimator(device: str = "CPU"):
 def _prepare_ansatz_for_estimator(ansatz: QuantumCircuit, device: str) -> QuantumCircuit:
     """Return the circuit for `estimator.run()`.
 
-    The `device="GPU"` Aer estimator can't handle a `QAOAAnsatz`'s opaque
-    `"QAOA"` instruction (`AerError: unknown instruction: QAOA`), so it's
-    decomposed to basis gates first (`reps=6`). `device="CPU"` handles the
-    raw ansatz untouched. Raises if `decompose()` reorders/renames
-    the parameters (which would corrupt the beta/gamma binding).
+    The Aer-backed estimators can't handle `QAOAAnsatz`'s opaque `QAOA`
+    instruction, so it's decomposed to basis gates first (`reps=6`).
+    `device="CPU"` handles the raw ansatz untouched.
     """
-    if device != "GPU":
+    if device not in AER_DEVICES:
         return ansatz
     decomposed = ansatz.decompose(reps=6)
     # Guard against decompose() ever silently reordering/dropping the
@@ -124,8 +138,8 @@ def _prepare_ansatz_for_estimator(ansatz: QuantumCircuit, device: str) -> Quantu
             "ansatz.decompose(reps=6) changed the parameter order/names "
             f"relative to the original ansatz ({original_names} -> "
             f"{decomposed_names}); refusing to proceed since this would "
-            "silently corrupt the beta/gamma parameter binding on the GPU "
-            "path."
+            "silently corrupt the beta/gamma parameter binding on the "
+            f"Aer-backed {device!r} path."
         )
     return decomposed
 
@@ -544,6 +558,50 @@ if __name__ == "__main__":
         )
     except ImportError:
         print("[INFO] qiskit_aer not importable -- skipping Aer-backend stand-in check.")
+
+    # ---- 4c. device='CPU_AER': the actual selectable matched-engine device
+    print("\n--- device='CPU_AER' (matched-simulator-engine CPU benchmark for GPU comparisons) ---")
+    try:
+        from qiskit_aer.primitives import EstimatorV2 as AerEstimatorV2
+
+        estimator_cpu_aer = build_estimator(device="CPU_AER")
+        check(
+            "build_estimator('CPU_AER') returns an Aer EstimatorV2",
+            isinstance(estimator_cpu_aer, AerEstimatorV2),
+            f"got {type(estimator_cpu_aer)}",
+        )
+        check(
+            "_prepare_ansatz_for_estimator decomposes the ansatz for device='CPU_AER' "
+            "(same as it does for 'GPU')",
+            _prepare_ansatz_for_estimator(ansatz_tmp, device="CPU_AER").num_parameters
+            == ansatz_tmp.num_parameters
+            and set(_prepare_ansatz_for_estimator(ansatz_tmp, device="CPU_AER").count_ops())
+            != set(ansatz_tmp.count_ops()),
+        )
+
+        result_cpu_aer = optimize_qaoa(
+            ansatz_tmp, H_tmp, optimizer_method="COBYLA", device="CPU_AER", seed=0
+        )
+        check(
+            "device='CPU_AER' optimize_qaoa runs end-to-end and returns a finite energy",
+            np.isfinite(result_cpu_aer.optimal_energy),
+            f"optimal_energy={result_cpu_aer.optimal_energy}",
+        )
+
+        # Same params, same underlying math -> should agree closely
+        # with device='CPU' (StatevectorEstimator)
+        cpu_aer_cost_fn = make_cost_function(ansatz_tmp, H_tmp, estimator_cpu_aer, device="CPU_AER")
+        cpu_cost_fn = make_cost_function(ansatz_tmp, H_tmp, StatevectorEstimator(), device="CPU")
+        probe_params = np.array([0.3, 0.5])
+        ev_cpu_aer = cpu_aer_cost_fn(probe_params)
+        ev_cpu = cpu_cost_fn(probe_params)
+        check(
+            "device='CPU_AER' agrees with device='CPU' on the same params",
+            np.isclose(ev_cpu_aer, ev_cpu, atol=1e-8),
+            f"CPU_AER={ev_cpu_aer:.8f}, CPU={ev_cpu:.8f}",
+        )
+    except ImportError:
+        print("[INFO] qiskit_aer not importable -- skipping device='CPU_AER' check.")
 
     # ---- 5. initial_params is actually used, not silently ignored --------
     print("\n--- initial_params warm-start hook: actually used, not ignored ---")
