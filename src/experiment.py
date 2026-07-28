@@ -1,27 +1,28 @@
-"""Depth-sweep, optimizer, & coupling experiment runner.
+"""Depth-sweep, optimizer, & warm-start comparison experiment runner.
 
-For each (Ising instance, QAOA depth `p`, optimizer method), runs a
-multi-restart QAOA optimization (`optimizer.run_qaoa_multi_restart`) and
-records the best energy found against the exact ground-state energy `E_0`
+Part A -- depth sweep: for each (Ising instance, QAOA depth `p`, optimizer
+method), runs a multi-restart QAOA optimization
+(`optimizer.run_qaoa_multi_restart`) and records the best energy found
+against the exact ground-state energy `E_0`
 (`exact_solver.ground_state_energy`) as the relative energy error:
 
     epsilon(p) = (E_qaoa(p) - E_0) / |E_0|
 
-Only calls into `ising_model.py`/`exact_solver.py`/`qaoa_circuit.py`/
-`optimizer.py` -- no instance generation, Hamiltonian/circuit construction,
-or optimizer logic lives here. `device` and `warm_start_fn` (inert) are
-passed straight through to `run_qaoa_multi_restart`.
-
 `run_depth_sweep` returns a `list[SweepRecord]`, one per (instance, p,
-optimizer_method) combination, containing everything a plotting script needs
-(`epsilon(p)` vs `p`, per-restart energies, cost/timing, diagnostics).
-`records_to_dicts` converts that to plain-Python dicts for
-`json.dump`/`pandas.DataFrame`.
+optimizer_method) combination.
+
+Part B -- warm-start comparison: runs standard QAOA against Egger-WS and
+ND-AWS on the uniform AFM ring (`ising_model.generate_uniform_AFM_ring`),
+emitting one CSV row per `(n, p, method)`. `run_warm_start_comparison_point`
+builds one row, `run_warm_start_comparison` sweeps `(n, p)`, and
+`write_warm_start_comparison_csv` writes the result.
 """
 
 from __future__ import annotations
 
+import csv
 import itertools
+import os
 import time
 import warnings
 from dataclasses import dataclass
@@ -29,9 +30,14 @@ from typing import Callable, Dict, Iterable, List, Optional, Union
 
 import numpy as np
 
-from src.exact_solver import ground_state_energy
-from src.ising_model import IsingInstance, generate_test_instances
+from src.exact_solver import (
+    ground_state_energy,
+    ground_state_success_probability,
+    two_point_correlators,
+)
+from src.ising_model import IsingInstance, generate_test_instances, generate_uniform_AFM_ring
 from src.qaoa_circuit import build_qaoa_circuit_for_instance
+from src import optimizer as optimizer_module
 from src.optimizer import (
     VALID_DEVICES,
     VALID_OPTIMIZER_METHODS,
@@ -45,11 +51,8 @@ from src.optimizer import (
 
 @dataclass
 class SweepRecord:
-    """One (instance, p, optimizer_method) point of the depth sweep.
-
-    Everything a plotting script needs for an `epsilon(p)` vs. `p` curve
-    (per instance, per optimizer).
-    """
+    """One (instance, p, optimizer_method) point of the depth sweep --
+    everything a plotting script needs for an `epsilon(p)` vs. `p` curve."""
 
     instance_name: str
     n_spins: int
@@ -75,14 +78,8 @@ class SweepRecord:
 
 
 def relative_energy_error(E_qaoa: float, E_0: float) -> float:
-    """`epsilon = (E_qaoa - E_0) / |E_0|`
-
-    `E_0 == 0` makes the relative error undefined (division by zero); this
-    is not expected for any instance in `ising_model.generate_test_instances`
-    (couplings are never all-zero), but is still checked for,
-    since a degenerate all-zero-coupling/all-zero-field instance is
-    still constructible by hand.
-    """
+    """`epsilon = (E_qaoa - E_0) / |E_0|`. Warns and returns `nan` if
+    `E_0 ~ 0` rather than dividing by zero."""
     if abs(E_0) < 1e-12:
         warnings.warn(
             f"relative_energy_error: E_0={E_0!r} is ~0, relative error is "
@@ -110,18 +107,8 @@ def run_sweep_point(
     warm_start_fn: Optional[Callable] = None,
     E_0: Optional[float] = None,
 ) -> SweepRecord:
-    """Run one (instance, p, optimizer_method) point of the depth sweep.
-
-    Builds a fresh `(ansatz, cost_hamiltonian)` pair via
-    `qaoa_circuit.build_qaoa_circuit_for_instance(instance, p=p)`, runs
-    `optimizer.run_qaoa_multi_restart()` with `device`/`warm_start_fn`
-    forwarded, and records the result against `E_0` (computed via
-    `exact_solver.ground_state_energy` if not supplied).
-
-    Returns
-    -------
-    SweepRecord
-    """
+    """Run one (instance, p, optimizer_method) point: build the ansatz,
+    run `optimizer.run_qaoa_multi_restart`, record against `E_0`."""
     if optimizer_method not in VALID_OPTIMIZER_METHODS:
         raise ValueError(
             f"optimizer_method must be one of {VALID_OPTIMIZER_METHODS}, got {optimizer_method!r}"
@@ -187,46 +174,8 @@ def run_depth_sweep(
     warm_start_fn: Optional[Callable] = None,
     verbose: bool = False,
 ) -> List[SweepRecord]:
-    """Run the full instance x p x optimizer depth sweep.
-
-    Parameters
-    ----------
-    instances : dict[str, IsingInstance], iterable of IsingInstance, or None
-        Defaults to `ising_model.generate_test_instances()`.
-    p_values : iterable of int
-        QAOA depths to sweep. Design spec default is `1..5`
-        (`range(1, 6)`).
-    optimizer_methods : iterable of str
-        Optimizer methods to sweep, each one of
-        `optimizer.VALID_OPTIMIZER_METHODS` (`"COBYLA"`, `"L-BFGS-B"`).
-        Defaults to both.
-    device : str
-        `"CPU"` or `"GPU"`, forwarded to
-        `optimizer.run_qaoa_multi_restart` for every sweep point. Device
-        choice is not decided here.
-    n_restarts : int
-        Random restarts per (instance, p, optimizer) point, forwarded to
-        `run_qaoa_multi_restart`. Default is 5.
-    minimize_options : dict, optional
-        Forwarded to `scipy.optimize.minimize` via
-        `optimizer.optimize_qaoa`.
-    seed : int, optional
-        Seeds a `numpy.random.SeedSequence`
-    warm_start_fn : callable, optional
-        Forwarded to `run_qaoa_multi_restart` for every sweep
-        point. Unused within `run_qaoa_multi_restart` this pass (see
-        `optimizer.py`).
-    verbose : bool
-        If True, print a one-line progress/result summary per sweep point
-        (best energy, epsilon, wall time) as it completes.
-
-    Returns
-    -------
-    list[SweepRecord]
-        One record per (instance, p, optimizer_method) combination, in
-        the order: outer loop over instances (dict/iteration order),
-        then `p_values`, then `optimizer_methods`.
-    """
+    """Run the full instance x p x optimizer depth sweep; one `SweepRecord`
+    per combination, one independent RNG stream per point (`seed`)."""
     if instances is None:
         instance_map: Dict[str, IsingInstance] = generate_test_instances()
     elif isinstance(instances, dict):
@@ -278,16 +227,13 @@ def run_depth_sweep(
 
 
 # --------------------------------------------------------------------------
-# Plain-Python conversion helper (for json.dump / pandas.DataFrame / plotting)
+# Conversion helper (for json.dump / pandas.DataFrame / plotting)
 # --------------------------------------------------------------------------
 
 
 def records_to_dicts(records: Iterable[SweepRecord]) -> List[dict]:
-    """Convert `SweepRecord`s to plain-Python dicts (numpy arrays -> lists,
-    numpy scalars -> float/int/bool) -- directly usable as
-    `json.dump(records_to_dicts(records), f)` or
-    `pandas.DataFrame(records_to_dicts(records))`.
-    """
+    """`SweepRecord`s -> plain-Python dicts (numpy arrays -> lists, numpy
+    scalars -> float/int/bool), for `json.dump`/`pandas.DataFrame`."""
     out = []
     for r in records:
         out.append(
@@ -315,247 +261,288 @@ def records_to_dicts(records: Iterable[SweepRecord]) -> List[dict]:
 
 
 # --------------------------------------------------------------------------
-# Self-check (small-scale -- NOT the full design-spec sweep,
-# exercises the same code path at reduced p/restarts/instances)
+# Warm-start comparison runner (standard QAOA vs. Egger-WS vs. ND-AWS)
 # --------------------------------------------------------------------------
+#
+# Compares `src.warm_start.egger_ws.run_standard_qaoa` / `run_egger_ws` /
+# `nd_aws_to_comparison_result` head-to-head on the uniform AFM
+# ring (`ising_model.generate_uniform_AFM_ring`), emitting one CSV row per (n, p).
 
-if __name__ == "__main__":
-    import sys
-    import os
+VALID_WS_METHODS = ("standard", "egger_continuous", "egger_rounded", "nd_aws")
 
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+WS_CSV_COLUMNS = (
+    ["n", "p", "topology", "E_gs", "E_sim", "delta_E", "P_gs"]
+    + [f"C{i}" for i in range(1, 11)]
+    + [f"gamma_{i}" for i in range(4)]
+    + [f"beta_{i}" for i in range(4)]
+    + ["method", "n_circuit_evals", "wall_time_s"]
+)
 
-    from src import ising_model as im
-    from src import exact_solver as es
+DEFAULT_WS_CSV_FILENAME = "ising_results.csv"
 
-    failures = []
 
-    def check(label, cond, detail=""):
-        status = "PASS" if cond else "FAIL"
-        print(f"[{status}] {label}" + (f" -- {detail}" if detail else ""))
-        if not cond:
-            failures.append(label)
+class _CircuitCallCounter:
+    """Shared mutable `.n_calls` tally, incremented by every
+    `_CountingEstimator`/`_CountingSampler` routed through it."""
 
-    # ---- 0. relative_energy_error arithmetic check -----------------------
-    print("\n--- relative_energy_error arithmetic check ---")
-    check(
-        "relative_energy_error(-1.7, -2.0) == (-1.7 - -2.0)/abs(-2.0) == 0.15",
-        np.isclose(relative_energy_error(-1.7, -2.0), 0.15, atol=1e-12),
-        f"got {relative_energy_error(-1.7, -2.0)}",
+    def __init__(self) -> None:
+        self.n_calls = 0
+
+
+class _CountingEstimator:
+    """Wraps an Estimator, counting `.run()` calls against a shared
+    `_CircuitCallCounter`."""
+
+    def __init__(self, inner, counter: _CircuitCallCounter) -> None:
+        self._inner = inner
+        self._counter = counter
+
+    def run(self, *args, **kwargs):
+        self._counter.n_calls += 1
+        return self._inner.run(*args, **kwargs)
+
+
+class _CountingSampler:
+    """Same wrapping pattern as `_CountingEstimator`, for `Sampler`
+    primitives (ND-AWS's bitstring-sampling step, `nd_aws.sample_bitstrings`)."""
+
+    def __init__(self, inner, counter: _CircuitCallCounter) -> None:
+        self._inner = inner
+        self._counter = counter
+
+    def run(self, *args, **kwargs):
+        self._counter.n_calls += 1
+        return self._inner.run(*args, **kwargs)
+
+
+def _run_ws_method(
+    method: str,
+    instance: IsingInstance,
+    p: int,
+    device: str,
+    optimizer_method: str,
+    n_restarts: int,
+    minimize_options: Optional[dict],
+    seed: Optional[int],
+    egger_variant: str,
+    egger_eps: float,
+    egger_relaxation_kwargs: Optional[dict],
+    ndaws_kwargs: Optional[dict],
+):
+    """Dispatches to one of the three `warm_start.egger_ws` methods.
+    Returns `(result, n_circuit_evals, notes)`."""
+    from src.warm_start.egger_ws import (
+        VALID_EGGER_VARIANTS,
+        nd_aws_to_comparison_result,
+        run_egger_ws,
+        run_standard_qaoa,
     )
-    check(
-        "relative_energy_error(E_0, E_0) == 0",
-        np.isclose(relative_energy_error(-2.0, -2.0), 0.0, atol=1e-12),
-    )
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        result_nan = relative_energy_error(1.0, 0.0)
-        check(
-            "relative_energy_error(_, 0.0) warns and returns nan (guarded, not a crash)",
-            len(w) == 1 and np.isnan(result_nan),
-            f"warnings={len(w)}, result={result_nan}",
+    from src.warm_start.nd_aws import build_default_sampler
+
+    notes: Dict[str, str] = {}
+    counter = _CircuitCallCounter()
+
+    if method == "standard":
+        estimator = _CountingEstimator(optimizer_module.build_estimator(device), counter)
+        result = run_standard_qaoa(
+            instance,
+            p=p,
+            optimizer_method=optimizer_method,
+            device=device,
+            n_restarts=n_restarts,
+            minimize_options=minimize_options,
+            seed=seed,
+            estimator=estimator,
         )
-
-    # ---- 1. Small-scale depth sweep on two easy analytic instances --------
-    # NOT the full design-spec sweep --
-    # reduced p range and restart count, but enough to exercise run_depth_sweep's full
-    # code path and see a real epsilon(p) -> 0 trend on instances QAOA should solve easily.
-    print("\n--- Small-scale depth sweep: TWO_SPIN_FM (E_0=-1.0), THREE_SPIN_AFM (E_0=-2.0) ---")
-    easy_instances = {
-        "two_spin_FM": im.TWO_SPIN_FM_INSTANCE,
-        "three_spin_AFM": im.THREE_SPIN_AFM_INSTANCE,
-    }
-    P_VALUES = (1, 2, 3)
-    N_RESTARTS = 3
-    t_sweep0 = time.time()
-    records = run_depth_sweep(
-        instances=easy_instances,
-        p_values=P_VALUES,
-        optimizer_methods=("COBYLA", "L-BFGS-B"),
-        device="CPU",
-        n_restarts=N_RESTARTS,
-        minimize_options={"maxiter": 200},
-        seed=7,
-        warm_start_fn=None,
-        verbose=True,
-    )
-    t_sweep = time.time() - t_sweep0
-    print(f"[INFO] small-scale sweep took {t_sweep:.2f}s total for {len(records)} records")
-
-    n_expected = len(easy_instances) * len(P_VALUES) * 2
-    check(
-        f"run_depth_sweep returns instances x p x optimizers == {n_expected} records",
-        len(records) == n_expected,
-        f"got {len(records)}",
-    )
-
-    # ---- 2. E_0 cross-check: sweep's E_0 vs. an independently-recomputed ------
-    print("\n--- E_0 cross-check (sweep-recorded vs. independently recomputed) ---")
-    expected_e0 = {"two_spin_FM": -1.0, "three_spin_AFM": -2.0}
-    for name, instance in easy_instances.items():
-        e0_independent = es.ground_state_energy(*instance.as_tuple())
-        recs_for_instance = [r for r in records if r.instance_name == name]
-        e0_in_records = {r.E_0 for r in recs_for_instance}
-        check(
-            f"{name}: exact_solver.ground_state_energy (independent call) == documented E_0={expected_e0[name]}",
-            np.isclose(e0_independent, expected_e0[name], atol=1e-10),
-            f"got {e0_independent}",
-        )
-        check(
-            f"{name}: every sweep record's E_0 == independently-recomputed E_0 (single consistent value)",
-            len(e0_in_records) == 1 and np.isclose(e0_in_records.pop(), e0_independent, atol=1e-10),
-            f"E_0 values seen in records={ {r.E_0 for r in recs_for_instance} }",
-        )
-
-    # ---- 3. epsilon(p) trend: report actual numbers, confirm it heads toward 0 as p increases -----
-    print("\n--- epsilon(p) trend (best-of-optimizers per p) ---")
-    for name in easy_instances:
-        print(f"  instance={name}")
-        eps_by_p = {}
-        for p in P_VALUES:
-            recs_p = [r for r in records if r.instance_name == name and r.p == p]
-            best_eps = min(r.epsilon for r in recs_p)
-            eps_by_p[p] = best_eps
-            per_optimizer = ", ".join(
-                f"{r.optimizer_method}: eps={r.epsilon:.6f} (best_energy={r.best_energy:.6f})"
-                for r in sorted(recs_p, key=lambda r: r.optimizer_method)
+    elif method in ("egger_continuous", "egger_rounded"):
+        variant = "continuous" if method == "egger_continuous" else "rounded"
+        if egger_variant not in VALID_EGGER_VARIANTS:
+            raise ValueError(
+                f"egger_variant must be one of {VALID_EGGER_VARIANTS}, got {egger_variant!r}"
             )
-            print(f"    p={p}: {per_optimizer}  -> best_eps={best_eps:.6f}")
-        check(
-            f"{name}: epsilon(p) reaches (near-)0 by p={P_VALUES[-1]} (best-of-optimizers <= 0.05)",
-            eps_by_p[P_VALUES[-1]] <= 0.05,
-            f"eps by p={eps_by_p}",
+        estimator = _CountingEstimator(optimizer_module.build_estimator(device), counter)
+        result = run_egger_ws(
+            instance,
+            p=p,
+            variant=variant,
+            eps=egger_eps,
+            relaxation_kwargs=egger_relaxation_kwargs,
+            optimizer_method=optimizer_method,
+            device=device,
+            n_restarts=n_restarts,
+            minimize_options=minimize_options,
+            seed=seed,
+            estimator=estimator,
         )
-        check(
-            f"{name}: epsilon is non-negative (best_energy can't beat E_0, check on the exact-baseline direction)",
-            all(v >= -1e-6 for v in eps_by_p.values()),
-            f"eps by p={eps_by_p}",
+    elif method == "nd_aws":
+        kwargs = dict(ndaws_kwargs or {})
+        kwargs.setdefault("seed", seed)
+        kwargs.setdefault("device", device)
+        ndaws_device = kwargs["device"]
+
+        sampler_counter = _CircuitCallCounter()
+        # An explicitly supplied sampler still wins,
+        # otherwise default to the one matching the requested device.
+        inner_sampler = kwargs.get("sampler") or build_default_sampler(ndaws_device)
+        kwargs["sampler"] = _CountingSampler(inner_sampler, sampler_counter)
+        kwargs["estimator"] = _CountingEstimator(
+            optimizer_module.build_estimator(ndaws_device), counter
         )
 
-    # ---- 4. Checked epsilon arithmetic for one real record ----------
-    print("\n--- Checked epsilon arithmetic ---")
-    sample = records[0]
-    hand_epsilon = (sample.best_energy - sample.E_0) / abs(sample.E_0)
-    check(
-        f"record[0] ({sample.instance_name}, p={sample.p}, {sample.optimizer_method}): "
-        f"computed (E_qaoa - E_0)/|E_0| == record.epsilon",
-        np.isclose(hand_epsilon, sample.epsilon, atol=1e-12),
-        f"best_energy={sample.best_energy}, E_0={sample.E_0}, "
-        f"computed epsilon={hand_epsilon}, record.epsilon={sample.epsilon}",
-    )
-
-    # ---- 5. Record schema spot-check: every field a plotting script would -
-    #         need is present and correctly typed/shaped.
-    print("\n--- Record schema spot-check ---")
-    r = records[0]
-    check("record.instance_name is str", isinstance(r.instance_name, str), f"{r.instance_name!r}")
-    check("record.n_spins is int-like and > 0", int(r.n_spins) > 0, f"{r.n_spins}")
-    check("record.boundary in ('OBC', 'PBC')", r.boundary in ("OBC", "PBC"), f"{r.boundary!r}")
-    check("record.p is int-like and > 0", int(r.p) > 0, f"{r.p}")
-    check(
-        "record.optimizer_method in VALID_OPTIMIZER_METHODS",
-        r.optimizer_method in VALID_OPTIMIZER_METHODS,
-        f"{r.optimizer_method!r}",
-    )
-    check("record.device == 'CPU' (as requested)", r.device == "CPU", f"{r.device!r}")
-    check(
-        "record.n_restarts == N_RESTARTS requested",
-        int(r.n_restarts) == N_RESTARTS,
-        f"{r.n_restarts}",
-    )
-    check("record.E_0 is finite float", np.isfinite(r.E_0), f"{r.E_0}")
-    check("record.best_energy is finite float", np.isfinite(r.best_energy), f"{r.best_energy}")
-    check("record.epsilon is finite float", np.isfinite(r.epsilon), f"{r.epsilon}")
-    check(
-        "record.best_params has length == 2*p (beta+gamma per QAOA layer)",
-        len(r.best_params) == 2 * r.p,
-        f"len={len(r.best_params)}, expected {2 * r.p}",
-    )
-    check(
-        "record.restart_energies has length == n_restarts",
-        len(r.restart_energies) == r.n_restarts,
-        f"len={len(r.restart_energies)}, expected {r.n_restarts}",
-    )
-    check(
-        "record.best_energy == min(restart_energies) (best-of-restarts is actually the min)",
-        np.isclose(r.best_energy, min(r.restart_energies), atol=1e-12),
-        f"best_energy={r.best_energy}, min(restart_energies)={min(r.restart_energies)}",
-    )
-    check("record.success is bool", isinstance(r.success, bool), f"{type(r.success)}")
-    check("record.message is str", isinstance(r.message, str), f"{r.message!r}")
-    check(
-        "record.n_function_evals_total > 0",
-        int(r.n_function_evals_total) > 0,
-        f"{r.n_function_evals_total}",
-    )
-    check("record.wall_time_s >= 0", r.wall_time_s >= 0, f"{r.wall_time_s}")
-
-    # ---- 6. records_to_dicts round-trips cleanly (plain-Python, no numpy) -
-    print("\n--- records_to_dicts conversion sanity ---")
-    dicts = records_to_dicts(records)
-    check("records_to_dicts returns same length as records", len(dicts) == len(records))
-    d0 = dicts[0]
-    check(
-        "records_to_dicts: best_params is a plain list of floats (not ndarray)",
-        isinstance(d0["best_params"], list) and all(isinstance(x, float) for x in d0["best_params"]),
-        f"type={type(d0['best_params'])}",
-    )
-    check(
-        "records_to_dicts: epsilon value matches source record",
-        np.isclose(d0["epsilon"], records[0].epsilon, atol=1e-12),
-    )
-    import json
-
-    try:
-        json.dumps(dicts)
-        check("records_to_dicts output is JSON-serializable", True)
-    except TypeError as exc:
-        check("records_to_dicts output is JSON-serializable", False, str(exc))
-
-    # ---- 7. device/warm_start_fn are pure pass-throughs, not decided here -
-    print("\n--- device / warm_start_fn pass-through sanity ---")
-    passed_warm_start_calls = []
-
-    def _tracking_warm_start_fn(**kwargs):
-        # Deliberately never actually used by run_qaoa_multi_restart this pass (see optimizer.py).
-        # This just confirms experiment.py wires the argument through without breaking.
-        passed_warm_start_calls.append(kwargs)
-        return None
-
-    rec_ws = run_sweep_point(
-        im.TWO_SPIN_FM_INSTANCE,
-        p=1,
-        optimizer_method="COBYLA",
-        device="CPU",
-        n_restarts=2,
-        minimize_options={"maxiter": 50},
-        seed=0,
-        warm_start_fn=_tracking_warm_start_fn,
-    )
-    check(
-        "run_sweep_point accepts warm_start_fn without error (pass-through, unused downstream this pass)",
-        np.isfinite(rec_ws.best_energy),
-        f"best_energy={rec_ws.best_energy}",
-    )
-    check("record.device reflects the requested device ('CPU')", rec_ws.device == "CPU")
-
-    try:
-        run_sweep_point(im.TWO_SPIN_FM_INSTANCE, p=1, device="TPU", n_restarts=1)
-        check("run_sweep_point(device='TPU') raises ValueError", False)
-    except ValueError:
-        check("run_sweep_point(device='TPU') raises ValueError", True)
-
-    try:
-        run_sweep_point(im.TWO_SPIN_FM_INSTANCE, p=1, optimizer_method="SPSA", n_restarts=1)
-        check("run_sweep_point(optimizer_method='SPSA') raises ValueError", False)
-    except ValueError:
-        check("run_sweep_point(optimizer_method='SPSA') raises ValueError", True)
-
-    print("\n" + ("=" * 60))
-    if failures:
-        print(f"{len(failures)} check(s) FAILED:")
-        for f in failures:
-            print(f"  - {f}")
-        sys.exit(1)
+        result = nd_aws_to_comparison_result(instance, p=p, ndaws_kwargs=kwargs)
+        counter.n_calls += sampler_counter.n_calls
     else:
-        print("All checks passed.")
+        raise ValueError(f"method must be one of {VALID_WS_METHODS}, got {method!r}")
+
+    return result, counter.n_calls, notes
+
+
+def run_warm_start_comparison_point(
+    n_spins: int,
+    p: int,
+    method: str,
+    J_value: float = 1.0,
+    h_value: float = 0.0,
+    device: str = "CPU",
+    optimizer_method: str = "L-BFGS-B",
+    n_restarts: int = 3,
+    minimize_options: Optional[dict] = None,
+    seed: Optional[int] = None,
+    egger_variant: str = "continuous",
+    egger_eps: float = 0.1,
+    egger_relaxation_kwargs: Optional[dict] = None,
+    ndaws_kwargs: Optional[dict] = None,
+    assert_energy_correlator_identity: bool = True,
+) -> dict:
+    """One (n, p, method) CSV row on the uniform AFM ring; `method` in
+    `VALID_WS_METHODS` dispatches via `_run_ws_method`. `p` must be `<= 4`."""
+    if method not in VALID_WS_METHODS:
+        raise ValueError(f"method must be one of {VALID_WS_METHODS}, got {method!r}")
+    if not (1 <= p <= 4):
+        raise ValueError(f"p must be in 1..4 to fit this CSV schema's fixed gamma/beta slots, got {p}")
+    if device not in VALID_DEVICES:
+        raise ValueError(f"device must be one of {VALID_DEVICES}, got {device!r}")
+
+    instance = generate_uniform_AFM_ring(n_spins, J_value=J_value, h_value=h_value)
+    J, h, boundary = instance.as_tuple()
+
+    E_gs = ground_state_energy(J, h, boundary, n_spins)
+
+    t0 = time.time()
+    result, n_circuit_evals, notes = _run_ws_method(
+        method,
+        instance,
+        p,
+        device,
+        optimizer_method,
+        n_restarts,
+        minimize_options,
+        seed,
+        egger_variant,
+        egger_eps,
+        egger_relaxation_kwargs,
+        ndaws_kwargs,
+    )
+    wall_time_s = time.time() - t0
+
+    E_sim = float(result.optimal_energy)
+    delta_E = E_sim - E_gs
+    P_gs = ground_state_success_probability(result.statevector, J, h, boundary, n_spins)
+    correlators = two_point_correlators(result.statevector, n_spins, r_max=10)
+
+    if abs(h_value) < 1e-12:
+        expected_E = J_value * n_spins * float(correlators[0])
+        if not np.isclose(E_sim, expected_E, atol=1e-6, rtol=1e-6):
+            msg = (
+                f"E_sim == n_spins * J_value * C_1 identity failed: "
+                f"n={n_spins}, p={p}, method={method!r}: E_sim={E_sim}, "
+                f"n*J*C_1={expected_E} (C_1={correlators[0]})"
+            )
+            if assert_energy_correlator_identity:
+                raise AssertionError(msg)
+            warnings.warn(msg, stacklevel=2)
+
+    params = np.asarray(result.optimal_params, dtype=float)
+    beta, gamma = params[:p], params[p : 2 * p]
+
+    row: Dict[str, object] = {
+        "n": int(n_spins),
+        "p": int(p),
+        "topology": boundary,
+        "E_gs": float(E_gs),
+        "E_sim": E_sim,
+        "delta_E": float(delta_E),
+        "P_gs": float(P_gs),
+    }
+    for i in range(10):
+        row[f"C{i + 1}"] = float(correlators[i])
+    for i in range(4):
+        row[f"gamma_{i}"] = float(gamma[i]) if i < p else ""
+    for i in range(4):
+        row[f"beta_{i}"] = float(beta[i]) if i < p else ""
+    row["method"] = method
+    row["n_circuit_evals"] = int(n_circuit_evals)
+    row["wall_time_s"] = float(wall_time_s)
+
+    return row
+
+
+def run_warm_start_comparison(
+    n_values: Iterable[int],
+    p_values: Iterable[int],
+    method: str,
+    seed: Optional[int] = None,
+    verbose: bool = False,
+    **point_kwargs,
+) -> List[dict]:
+    """Runs `run_warm_start_comparison_point` over every `(n, p)`, one
+    independent RNG child per point; returns a flat `list[dict]` of rows."""
+    combos = list(itertools.product(n_values, p_values))
+    seed_seq = np.random.SeedSequence(seed)
+    child_seed_seqs = seed_seq.spawn(len(combos))
+
+    rows = []
+    for (n_spins, p), child_seed_seq in zip(combos, child_seed_seqs):
+        child_seed = int(child_seed_seq.generate_state(1)[0])
+        row = run_warm_start_comparison_point(
+            n_spins, p, method, seed=child_seed, **point_kwargs
+        )
+        rows.append(row)
+        if verbose:
+            notes = row.pop("_notes", None)
+            print(
+                f"[n={row['n']}, p={row['p']}, method={method}] "
+                f"E_gs={row['E_gs']:.6f} E_sim={row['E_sim']:.6f} "
+                f"P_gs={row['P_gs']:.6f} n_circuit_evals={row['n_circuit_evals']} "
+                f"wall_time_s={row['wall_time_s']:.2f}"
+                + (f"  [note: {notes}]" if notes else "")
+            )
+    for row in rows:
+        row.pop("_notes", None)
+    return rows
+
+
+def _default_results_dir() -> str:
+    """`<repo_root>/results`, derived from `__file__` so it's cwd-independent."""
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "results")
+
+
+def write_warm_start_comparison_csv(
+    rows: Iterable[dict],
+    filename: str = DEFAULT_WS_CSV_FILENAME,
+    results_dir: Optional[str] = None,
+) -> str:
+    """Writes `rows` to `<results_dir>/<filename>` in `WS_CSV_COLUMNS`
+    order; `results_dir` defaults to `<repo_root>/results`. Returns the path."""
+    if results_dir is None:
+        results_dir = _default_results_dir()
+    os.makedirs(results_dir, exist_ok=True)
+    path = os.path.join(results_dir, filename)
+
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=WS_CSV_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    return path

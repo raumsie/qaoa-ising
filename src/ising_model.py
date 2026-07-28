@@ -1,4 +1,3 @@
-# noinspection PyPep8Naming
 """
 ising_model.py
 ==============
@@ -44,20 +43,8 @@ VALID_BOUNDARIES = ("OBC", "PBC")
 
 @dataclass(frozen=True)
 class IsingInstance:
-    """A single 1D Ising problem instance.
-
-    Attributes
-    ----------
-    name : str
-        label
-    n_spins : int
-        Number of spins/qubits in the chain.
-    J : np.ndarray
-        Coupling array with length `n_spins - 1` for OBC, `n_spins` for PBC.
-    h : np.ndarray
-        Local field array with length `n_spins`.
-    boundary : str
-        `OBC` or `PBC`.
+    """A single 1D Ising problem instance:
+    `name`, `n_spins`, `J`, `h`, `boundary`, `description`.
     """
 
     name: str
@@ -123,10 +110,7 @@ def generate_couplings(
     rng: Optional[np.random.Generator] = None,
     seed: Optional[int] = None,
 ) -> np.ndarray:
-    """Random coupling array `J`, sized for the given boundary condition.
-
-    distribution : "uniform" -> Uniform(low, high); "gaussian" -> Normal(mean, std)
-    """
+    """Random coupling array `J`, sized for the given boundary condition."""
     rng = _get_rng(rng, seed)
     n_couplings = _num_couplings(n_spins, boundary)
     if distribution == "uniform":
@@ -150,13 +134,7 @@ def generate_fields(
     rng: Optional[np.random.Generator] = None,
     seed: Optional[int] = None,
 ) -> np.ndarray:
-    """Local field array `h`
-
-    `h_i` is the coefficient of a single-qubit Z_i
-    term acting on spin `i`. It can favor a spin
-    pointing up (h_i < 0) or down (h_i > 0),
-    independent of its neighbors. 
-    """
+    """Local field array `h`; `h_i` is the coefficient of `Z_i` on spin `i`."""
     # default: `h_i = 0`
     # coupling only case
     if mode == "zero":
@@ -191,11 +169,7 @@ def generate_uniform_FM_chain(
     h_value: float = 0.0,
     name: Optional[str] = None,
 ) -> IsingInstance:
-    """Uniform chain: every coupling and field is identical
-    (no randomness)
-    `J = np.full(n_couplings, J_value)` : every bond gets same coupling strength
-    `h = np.full(n_spins, h_value)` : every site gets same field
-    """
+    """Uniform chain: every coupling and field is identical (no randomness)."""
     n_couplings = _num_couplings(n_spins, boundary)
     J = np.full(n_couplings, float(J_value))
     h = np.full(n_spins, float(h_value))
@@ -231,10 +205,8 @@ def generate_random_chain(
     rng: Optional[np.random.Generator] = None,
     name: Optional[str] = None,
 ) -> IsingInstance:
-    """Random instance generator: random couplings,
-     plus optional random/uniform/zero field.
-
-    This is used by the generators below.
+    """Random instance generator:
+    random couplings plus optional random/uniform/zero field.
     """
     rng = _get_rng(rng, seed)
     J = generate_couplings(
@@ -282,14 +254,7 @@ def generate_frustrated_chain(
     rng: Optional[np.random.Generator] = None,
     name: Optional[str] = None,
 ) -> IsingInstance:
-    """Wrapper around `generate_random_chain` :
-
-    passes `distribution`/`low`/`high`/`mean`/`std`
-    as the coupling distribution parameters.
-    Hardcodes `h_mode="zero"` (no field).
-    `generate_random_chain` then calls `generate_couplings`
-    and `generate_fields`
-    """
+    """Wrapper around `generate_random_chain`; hardcodes `h_mode="zero"` (no field)."""
     instance = generate_random_chain(
         n_spins,
         boundary=boundary,
@@ -319,26 +284,9 @@ def generate_field_chain(
     rng: Optional[np.random.Generator] = None,
     name: Optional[str] = None,
 ) -> IsingInstance:
-    """Uniform coupling chain with a nonzero random
-    local field on every site.
-
-    Builds `J` and `h` rather than getting them
-    from `generate_random_chain`.
-
-    `J = np.full(n_couplings, J_value)` : fixed coupling
-    `h = generate_fields() : calls `generate_fields`
-    with `mode="random"`.
-
-    The field's default range is narrower to act
-    as a perturbation on top of the dominant
-    coupling terms. If `h` routinely matched or exceeded
-    `|J|`, each site's field term would dominate its own
-    energy contribution, and the ground state would
-    collapse toward each spin just aligning with its
-    local field term. This would disrupt the collective
-    chain behavior. Keeping `|h| < |J|` by default
-    preserves the coupling while still introducing
-    field-driven frustration.
+    """Uniform coupling chain with a nonzero random local field on every
+    site; default field range is narrower than `J`'s so the field
+    perturbs rather than dominates.
     """
     rng = _get_rng(rng, seed)
     n_couplings = _num_couplings(n_spins, boundary)
@@ -366,18 +314,42 @@ def generate_field_chain(
     )
 
 
-def generate_test_instances(n_spins: int = 6, seed: int = 42) -> dict:
-    """Assembles the depth sweep. Calls generator functions.
+def generate_uniform_AFM_ring(
+    n_spins: int,
+    J_value: float = 1.0,
+    h_value: float = 0.0,
+    name: Optional[str] = None,
+) -> IsingInstance:
+    """Uniform AFM ring: `J_i = +J_value` on every bond
 
-    Each random instance gets a distinct seed.
+    H = J_value * sum_i Z_i * Z_{(i+1) mod n_spins}  +  h_value * sum_i Z_i
 
-    Intended import path (design spec Section 6a):
-        from src.ising_model import generate_test_instances
+    Analytic ground-state energy (for `J_value=1.0`, `h_value=0`):
 
-    Returns
-    -------
-    dict[str, IsingInstance]
+        E_gs = -n_spins           for even n_spins
+        E_gs = -(n_spins - 2)     for odd n_spins
     """
+    n_couplings = _num_couplings(n_spins, "PBC")  # == n_spins
+    J = np.full(n_couplings, float(J_value))
+    h = np.full(n_spins, float(h_value))
+    return IsingInstance(
+        name=name or "uniform_AFM_ring",
+        n_spins=n_spins,
+        J=J,
+        h=h,
+        boundary="PBC",
+        description=(
+            f"Uniform J={J_value} (AFM) ring, PBC, h={h_value}. "
+            "E_gs = -n_spins for even n_spins (2-fold degenerate Neel "
+            "order), or -(n_spins - 2) for odd n_spins (2*n_spins-fold "
+            "degenerate, one frustrated bond)."
+        ),
+    )
+
+
+def generate_test_instances(n_spins: int = 6, seed: int = 42) -> dict:
+    """Assembles the depth sweep's four instances into a dict; each
+    random instance gets a distinct seed."""
     return {
         "uniform_FM": generate_uniform_FM_chain(
             n_spins, boundary="OBC", J_value=-1.0, h_value=0.0,
@@ -406,14 +378,10 @@ def generate_test_instances(n_spins: int = 6, seed: int = 42) -> dict:
 
 
 def two_spin_FM_instance() -> IsingInstance:
-    """2-spin OBC, J = [-1.0] (FM), h = [0, 0].
+    """2-spin OBC, J=[-1.0] (FM), h=[0,0]. E_0=-1.0 (aligned, doubly
+    degenerate); anti-aligned gives E=+1.0.
 
     H = -1 * Z_0 * Z_1
-
-    Spins aligned (Z_0*Z_1 = +1) :
-    both spins "up" or both "down" -> degenerate ground states, E_0 = -1.0.
-
-    Anti-aligned: E = +1.0.
     """
     J = np.array([-1.0])
     h = np.array([0.0, 0.0])
@@ -432,13 +400,10 @@ def two_spin_FM_instance() -> IsingInstance:
 
 
 def three_spin_AFM_instance() -> IsingInstance:
-    """3-spin OBC, J = [1.0, 1.0] (AFM), h = [0, 0, 0].
+    """3-spin OBC, J=[1,1] (AFM), h=[0,0,0]. Unfrustrated (OBC AFM chains
+    always are); E_0=-2.0, doubly degenerate (alternating spins).
 
     H = Z_0*Z_1 + Z_1*Z_2
-
-    Alternating spins -> each bond term = -1, E_0 = -2.0
-    This chain is unfrustrated (OBC AFM chains always are),
-    so every bond can be simultaneously satisfied.
     """
     J = np.array([1.0, 1.0])
     h = np.array([0.0, 0.0, 0.0])
@@ -456,14 +421,10 @@ def three_spin_AFM_instance() -> IsingInstance:
 
 
 def three_spin_frustrated_ring_instance() -> IsingInstance:
-    """3-spin PBC, J = [1.0, 1.0, 1.0]
-    (all AFM), h = [0, 0, 0].
+    """3-spin PBC, J=[1,1,1] (AFM), h=[0,0,0] -- the smallest frustrated
+    instance; E_0=-1.0, 6-fold degenerate (one bond always unsatisfied).
 
     H = Z_0*Z_1 + Z_1*Z_2 + Z_2*Z_0
-
-    This is the smallest frustrated instance: on an odd PBC instance,
-    not all AFM bonds can be satisfied simultaneously.
-    Ground state: exactly one bond unsatisfied.
     """
     J = np.array([1.0, 1.0, 1.0])
     h = np.array([0.0, 0.0, 0.0])

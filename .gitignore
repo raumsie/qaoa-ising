@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 
-# Generated sweep results (regenerate via notebooks/run_on_colab.ipynb) --
-# keep the directory tracked (.gitkeep) but not the data files themselves.
 results/*.json
+
+results/*.csv
 !results/.gitkeep

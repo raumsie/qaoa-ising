@@ -1,1 +1,0 @@
-"""qaoa-ising source package."""

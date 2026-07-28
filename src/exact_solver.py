@@ -1,4 +1,3 @@
-# noinspection PyPep8Naming
 """
 exact_solver.py
 ================
@@ -24,10 +23,6 @@ Convention:
     bit == 0 -> Z eigenvalue +1 ("spin up")
     bit == 1 -> Z eigenvalue -1 ("spin down")
         This matches Qiskit's `Z|0> = +|0>`.
-
-n is capped at 16 (`MAX_N_SPINS`) since a dense `2**16 x 2**16` matrix
-is already ~34 GB. Additionally, n > 14 is flagged with a warning
-as memory/time-heavy but still allowed up to the hard cap.
 """
 
 from __future__ import annotations
@@ -37,8 +32,14 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-MAX_N_SPINS = 16
-WARN_N_SPINS = 14
+# --------------------------------------------------------------------------
+# Size limits
+# --------------------------------------------------------------------------
+MAX_N_SPINS_DIAGONAL = 22
+WARN_N_SPINS_DIAGONAL = 20
+
+MAX_N_SPINS_DENSE = 14
+WARN_N_SPINS_DENSE = 12
 
 VALID_BOUNDARIES = ("OBC", "PBC")
 
@@ -70,34 +71,49 @@ def _infer_n_spins(J: np.ndarray, h: np.ndarray, boundary: str, n_spins: Optiona
     return n
 
 
-def _validate_n_spins(n_spins: int) -> None:
+def _validate_n_spins_diagonal(n_spins: int) -> None:
+    """Size check for the diagonal path."""
     if n_spins < 1:
         raise ValueError(f"n_spins must be >= 1, got {n_spins}")
-    if n_spins > MAX_N_SPINS:
+    if n_spins > MAX_N_SPINS_DIAGONAL:
         raise ValueError(
-            f"n_spins={n_spins} exceeds MAX_N_SPINS={MAX_N_SPINS}: a dense "
-            f"2**{n_spins} x 2**{n_spins} matrix is not practical to "
-            "diagonalize. Reduce chain length or use a different "
-            "sparse/iterative solver."
+            f"n_spins={n_spins} exceeds MAX_N_SPINS_DIAGONAL={MAX_N_SPINS_DIAGONAL} "
+            "for the diagonal path."
         )
-    if n_spins > WARN_N_SPINS:
+    if n_spins > WARN_N_SPINS_DIAGONAL:
+        dim = 2 ** n_spins
+        approx_mb = dim * 8 / 1e6
+        warnings.warn(
+            f"n_spins={n_spins} allocates length-{dim} float64 array(s) "
+            f"(~{approx_mb:.0f} MB each) on the diagonal path. "
+            f"Flagging since it exceeds WARN_N_SPINS_DIAGONAL="
+            f"{WARN_N_SPINS_DIAGONAL}.",
+            stacklevel=3,
+        )
+
+
+def _validate_n_spins_dense(n_spins: int) -> None:
+    """Size check for the dense path."""
+    if n_spins < 1:
+        raise ValueError(f"n_spins must be >= 1, got {n_spins}")
+    if n_spins > MAX_N_SPINS_DENSE:
+        raise ValueError(
+            f"n_spins={n_spins} exceeds MAX_N_SPINS_DENSE={MAX_N_SPINS_DENSE} "
+            "for the dense path."
+        )
+    if n_spins > WARN_N_SPINS_DENSE:
         dim = 2 ** n_spins
         approx_gb = (dim ** 2) * 8 / 1e9
         warnings.warn(
             f"n_spins={n_spins} builds a dense {dim} x {dim} matrix "
             f"(~{approx_gb:.1f} GB, float64). This is slow/memory-heavy; "
-            f"consider n_spins <= {WARN_N_SPINS} for interactive use.",
+            f"consider n_spins <= {WARN_N_SPINS_DENSE} for interactive use.",
             stacklevel=3,
         )
 
 
 def _boundary_pairs(n_spins: int, boundary: str):
-    """(i, j) index pairs for each coupling term, in J-array order.
-
-    OBC has n - 1 bonds, while PBC has n bonds.
-
-    When i = `n_spins - 1`, `(i + 1) % n_spins` wraps back to 0.
-    """
+    """(i, j) index pairs for each coupling term, in J-array order."""
     if boundary == "PBC":
         return [(i, (i + 1) % n_spins) for i in range(n_spins)]
     return [(i, i + 1) for i in range(n_spins - 1)] # OBC
@@ -108,58 +124,45 @@ def _boundary_pairs(n_spins: int, boundary: str):
 # --------------------------------------------------------------------------
 
 
+def _basis_spins(n_spins: int) -> np.ndarray:
+    """Spin values of every computational basis state, shape `(2**n, n)`."""
+    dim = 2 ** n_spins
+    # bit-shift arithmetic itself is done in int64 (dim can exceed int32
+    # range), only the final +-1 spin values are narrowed to int8.
+    indices = np.arange(dim, dtype=np.int64)
+    qubit_shifts = np.arange(n_spins, dtype=np.int64)
+    # bits[k, i] = bit i (qubit i) of basis index k
+    bits = ((indices[:, None] >> qubit_shifts[None, :]) & 1).astype(np.int8)
+    return np.int8(1) - np.int8(2) * bits  # bit 0 -> +1, bit 1 -> -1 ; shape (dim, n)
+
+
+def _bond_products(spins: np.ndarray, boundary: str) -> np.ndarray:
+    """`(dim, n_bonds)` elementwise spin products `s_i * s_{i+1}` for every bond."""
+    consecutive = spins[:, :-1] * spins[:, 1:]  # bonds (0,1), (1,2), ..., (n-2,n-1)
+    if boundary == "PBC":
+        wraparound = (spins[:, -1] * spins[:, 0])[:, None]  # bond (n-1, 0)
+        return np.concatenate([consecutive, wraparound], axis=1)
+    return consecutive
+
+
 def all_state_energies(
     J: np.ndarray, h: np.ndarray, boundary: str = "OBC", n_spins: Optional[int] = None
 ) -> np.ndarray:
     """Computes the classical Ising energy of every one of
     the 2**n basis states in one vectorized shot.
-
-    1. Validate/infer n from the shapes of J/h & boundary condition
-    2. Enumerate every basis index k as indices
-    3. Extract bits:
-        `(indices[:, None] >> qubit_shifts[None, :]) & 1`
-            produces a `(dim, n)` matrix `bits[k, i] = bit i` of integer k.
-            This is Qiskit's little endian convention. Qubit 0 is the
-            least significant bit. So `bits[k, 0]` is qubit 0's value
-            in basis state k.
-    4. Convert bits to spins:
-        `spins = 1 - 2*bits` maps bit 0 -> +1 ("up") and
-        bit 1 -> -1 ("down"), matching the convention Z|0⟩ = +|0⟩ .
-        Results in a `(dim, n)` array: one row per basis state &
-        one column per qubit.
-    5. `_boundary_pairs` gives the `(i, j)` bond list.
-        `pair_i/pair_j` are the arrays of the first/second indices.
-        `spins[:, pair_i] * spins[:, pair_j]` is a `(dim, n_bonds)` array
-        of `s_i * s_j` products for every state & every bond (n_bonds is
-        n-1 for OBC, n for PBC).
-    6. `@ J` contracts each row against the coupling strengths:
-        `(spins[:, pair_i] * spins[:, pair_j]) @ J` gives
-            `sum_bond J_bond * s_i * s_j`
-            which is the total coupling energy of every state.
-    7. Field energy is `spins @ h`, the same kind of contraction:
-        `sum_i h_i * s_i` per basis state.
-    8. Return `coupling_energy + field_energy` of shape `(dim,)`
-       where `energies[k]` is the total energy
-       `H = ΣJ*ZZ + Σh*Z` of basis state k.
     """
     n = _infer_n_spins(J, h, boundary, n_spins)
-    _validate_n_spins(n)
+    _validate_n_spins_diagonal(n)
 
     J = np.asarray(J, dtype=float)
     h = np.asarray(h, dtype=float)
 
     dim = 2 ** n
-    indices = np.arange(dim, dtype=np.uint64)
-    qubit_shifts = np.arange(n, dtype=np.uint64)
-    # bits[k, i] = bit i (qubit i) of basis index k
-    bits = ((indices[:, None] >> qubit_shifts[None, :]) & 1).astype(np.int64)
-    spins = 1 - 2 * bits  # bit 0 -> spin +1, bit 1 -> spin -1 ; shape (dim, n)
+    spins = _basis_spins(n)  # shape (dim, n), int8
 
-    pairs = _boundary_pairs(n, boundary)
-    if pairs:
-        pair_i = np.array([p[0] for p in pairs])
-        pair_j = np.array([p[1] for p in pairs])
-        coupling_energy = (spins[:, pair_i] * spins[:, pair_j]) @ J
+    bond_products = _bond_products(spins, boundary)  # shape (dim, n_bonds), int8
+    if bond_products.shape[1] > 0:
+        coupling_energy = bond_products @ J
     else:
         coupling_energy = np.zeros(dim)
 
@@ -173,29 +176,6 @@ def bitstring_energy(
 ) -> float:
     """Computes the classical Ising energy of a single spin configuration
         (unlike `all_state_energies` which computes all 2**n at once)
-
-    Steps:
-    1. Infer/validate `n`
-    2. Normalize `bits` into an int array.
-        Accepts either a string like "010"
-        or a sequence like [0, 1, 0]. `isinstance(bits, str)`
-        converts each char into an int, otherwise uses whatever
-        was passed via `np.asarray`. Either results in `bit_arr`,
-        idexed so `bit_arr[i]` is qubit i's value
-        (not the Qiskit reversed-string convention).
-    3. Length check:
-        `bit_arr` must have exactly `n` entries
-    4. Convert bits to spins:
-        `spins = 1 - 2*bit_arr` maps bit 0 -> +1 ("up") and
-        bit 1 -> -1 ("down"), matching the convention from `all_state_energies`
-    5. Coupling energy:
-        Non-vectorized, single-state equivalent of the
-        `spins[:, pair_i] * spins[:, pair_j] @ J` line in
-        `all_state_energies`.
-    6. Field energy:
-        `np.dot(spins, h)` == Σ h_i * s_i
-        The single-state version of `spins @ h`.
-    7. Return the sum, cast to float.
     """
     n = _infer_n_spins(J, h, boundary, n_spins)
     if isinstance(bits, str):
@@ -230,6 +210,94 @@ def ground_state_energy(
     return float(np.min(energies))
 
 
+
+# --------------------------------------------------------------------------
+# Cheap observables (diagonal path -- no dense matrix, no eigh)
+# --------------------------------------------------------------------------
+
+DEFAULT_DEGENERACY_TOL = 1e-6
+
+
+def ground_space_size(
+    J: np.ndarray,
+    h: np.ndarray,
+    boundary: str = "OBC",
+    n_spins: Optional[int] = None,
+    tol: float = DEFAULT_DEGENERACY_TOL,
+) -> int:
+    """Number of basis states within `tol` of the minimal energy, i.e. the
+    ground-space degeneracy.
+    """
+    energies = all_state_energies(J, h, boundary, n_spins)
+    e_gs = np.min(energies)
+    return int(np.sum(energies <= e_gs + tol))
+
+
+def _probabilities(psi: np.ndarray, input_kind: str) -> np.ndarray:
+    """Normalize `psi` into a probability array."""
+    psi = np.asarray(psi)
+    if input_kind == "statevector":
+        return np.abs(psi) ** 2
+    elif input_kind == "probabilities":
+        return np.asarray(psi, dtype=float)
+    raise ValueError(
+        f"input_kind must be 'statevector' or 'probabilities', got {input_kind!r}"
+    )
+
+
+def ground_state_success_probability(
+    psi: np.ndarray,
+    J: np.ndarray,
+    h: np.ndarray,
+    boundary: str = "OBC",
+    n_spins: Optional[int] = None,
+    tol: float = DEFAULT_DEGENERACY_TOL,
+    input_kind: str = "statevector",
+) -> float:
+    """P_gs: total probability mass on the (possibly degenerate) ground
+    space of `H = sum_i J_i * Z_i * Z_(i+1) + sum_i h_i * Z_i`.
+    """
+    n = _infer_n_spins(J, h, boundary, n_spins)
+
+    psi = np.asarray(psi)
+    if len(psi) != 2 ** n:
+        raise ValueError(f"psi must have length 2**n_spins ({2 ** n}), got {len(psi)}")
+
+    probs = _probabilities(psi, input_kind)
+    energies = all_state_energies(J, h, boundary, n)
+    e_gs = np.min(energies)
+    ground_mask = energies <= e_gs + tol
+    return float(np.sum(probs[ground_mask]))
+
+
+def two_point_correlators(
+    psi: np.ndarray,
+    n_spins: int,
+    r_max: int = 10,
+    input_kind: str = "statevector",
+) -> np.ndarray:
+    """Computes the full pairwise matrix `M[i,j] = ⟨Z_i Z_j⟩`"""
+    _validate_n_spins_diagonal(n_spins)
+    dim = 2 ** n_spins
+
+    psi = np.asarray(psi)
+    if len(psi) != dim:
+        raise ValueError(f"psi must have length 2**n_spins ({dim}), got {len(psi)}")
+
+    probs = _probabilities(psi, input_kind)
+    spins = _basis_spins(n_spins).astype(np.float64)  # shape (dim, n_spins)
+
+    weighted = spins * probs[:, None]  # shape (dim, n_spins)
+    M = spins.T @ weighted  # shape (n_spins, n_spins)
+
+    site_i = np.arange(n_spins)
+    correlators = np.empty(r_max, dtype=float)
+    for idx, r in enumerate(range(1, r_max + 1)):
+        site_j = (site_i + r) % n_spins
+        correlators[idx] = np.mean(M[site_i, site_j])
+    return correlators
+
+
 # --------------------------------------------------------------------------
 # Expensive path: full dense matrix + eigh (needed for eigenvector/overlap)
 # --------------------------------------------------------------------------
@@ -240,7 +308,7 @@ def build_full_hamiltonian_matrix(
 ) -> np.ndarray:
     """Build the full dense `2**n x 2**n` Hamiltonian matrix."""
     n = _infer_n_spins(J, h, boundary, n_spins)
-    _validate_n_spins(n)
+    _validate_n_spins_dense(n)
     # gets the (2**n,) array of every basis state's energy
     energies = all_state_energies(J, h, boundary, n)
     # expands the (2**n,) vector into a (2**n, 2**n) matrix
@@ -251,17 +319,7 @@ def build_full_hamiltonian_matrix(
 def exact_diagonalize(
     J: np.ndarray, h: np.ndarray, boundary: str = "OBC", n_spins: Optional[int] = None
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Full diagonalization via `numpy.linalg.eigh`.
-
-    Returns
-    -------
-    eigenvalues : np.ndarray, shape (2**n,), ascending order
-    eigenvectors : np.ndarray, shape (2**n, 2**n)
-        eigenvectors[:, k] is the eigenvector for eigenvalues[k], expressed
-        in the same little-endian computational basis as
-        `qiskit.quantum_info.Statevector` (qubit 0 = least significant
-        bit of the basis index).
-    """
+    """Full diagonalization via `numpy.linalg.eigh`."""
     H = build_full_hamiltonian_matrix(J, h, boundary, n_spins)
     eigenvalues, eigenvectors = np.linalg.eigh(H)
     return eigenvalues, eigenvectors
@@ -271,13 +329,7 @@ def ground_state(
     J: np.ndarray, h: np.ndarray, boundary: str = "OBC", n_spins: Optional[int] = None
 ) -> Tuple[float, np.ndarray]:
     """Ground-state energy and ground-state vector, for use in
-    comparisons against QAOA-produced statevectors.
-
-    Returns
-    -------
-    energy : float
-    vector : np.ndarray, shape (2**n,)
-    """
+    comparisons against QAOA-produced statevectors."""
     eigenvalues, eigenvectors = exact_diagonalize(J, h, boundary, n_spins)
     energy = float(eigenvalues[0])
     vector = eigenvectors[:, 0]
