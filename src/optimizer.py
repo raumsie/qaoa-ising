@@ -29,6 +29,34 @@ from src.qaoa_circuit import build_qaoa_circuit_for_instance, build_qaoa_circuit
 VALID_OPTIMIZER_METHODS = ("COBYLA", "L-BFGS-B")
 VALID_DEVICES = ("CPU", "GPU", "CPU_AER")
 
+# scipy rejects any option a given method doesn't recognize 
+# -- notably `maxfun`, which L-BFGS-B accepts and
+# COBYLA doesn't. Callers sweeping both optimizers pass one shared options
+# dict, so filter it per method rather than making them split.
+_SUPPORTED_MINIMIZE_OPTIONS = {
+    "COBYLA": ("maxiter", "rhobeg", "tol", "catol", "disp", "f_target"),
+    "L-BFGS-B": (
+        "maxiter",
+        "maxfun",
+        "maxcor",
+        "ftol",
+        "gtol",
+    ),
+}
+
+
+def filter_minimize_options(
+    minimize_options: Optional[dict], optimizer_method: str
+) -> Optional[dict]:
+    """Drop options `optimizer_method` doesn't support, so a single shared
+    options dict can be swept across optimizers without any warnings."""
+    if not minimize_options:
+        return minimize_options
+    supported = _SUPPORTED_MINIMIZE_OPTIONS.get(optimizer_method)
+    if supported is None:
+        return minimize_options
+    return {k: v for k, v in minimize_options.items() if k in supported}
+
 # --------------------------------------------------------------------------
 # Estimator construction
 # --------------------------------------------------------------------------
@@ -162,7 +190,7 @@ def optimize_qaoa(
         cost_function,
         x0,
         method=optimizer_method,
-        options=minimize_options,
+        options=filter_minimize_options(minimize_options, optimizer_method),
     )
 
     return QAOAOptimizationResult(
