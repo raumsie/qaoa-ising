@@ -35,7 +35,7 @@ import numpy as np
 # --------------------------------------------------------------------------
 # Size limits
 # --------------------------------------------------------------------------
-MAX_N_SPINS_DIAGONAL = 22
+MAX_N_SPINS_DIAGONAL = 30
 WARN_N_SPINS_DIAGONAL = 20
 
 MAX_N_SPINS_DENSE = 14
