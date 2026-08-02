@@ -10,28 +10,25 @@ Reuses `ws_ansatz.py`'s WS-QAOA initial state `|c> = RY(2*arcsin(sqrt(c)))|0>`
 and mixer `H_M^i = 2*sqrt(c_i(1-c_i))*X_i + (1-2*c_i)*Z_i` (Eq. A5-A8;
 chosen so `|c>` is the mixer's exact ground state) unchanged. New here: the
 classical "continuous relaxation" front end and a uniform
-`WarmStartComparisonResult` interface so standard QAOA / Egger-WS / ND-AWS
-can be run and compared interchangeably.
+`WarmStartComparisonResult` interface so standard QAOA and Egger-WS can be
+run and compared interchangeably.
 
-`run_egger_ws`/`run_standard_qaoa`/`nd_aws_to_comparison_result` return a
-common `WarmStartComparisonResult`.
+`run_egger_ws`/`run_standard_qaoa` return a common
+`WarmStartComparisonResult`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional
 
 import numpy as np
 from qiskit.circuit import QuantumCircuit
-from qiskit.primitives import StatevectorEstimator
 from qiskit.quantum_info import SparsePauliOp, Statevector
 
 from src.hamiltonian import build_ising_hamiltonian
 from src.optimizer import optimize_qaoa, run_qaoa_multi_restart
 from src.qaoa_circuit import build_qaoa_circuit_for_instance, build_qaoa_circuit_from_ising
-from src.warm_start.gauge import bits_to_int, gauge_transform
-from src.warm_start.nd_aws import run_nd_aws
 from src.warm_start.ws_ansatz import bias_from_bitstring, build_ws_ansatz
 
 VALID_EGGER_VARIANTS = ("continuous", "rounded")
@@ -186,8 +183,7 @@ def run_standard_qaoa(
     estimator=None,
 ) -> WarmStartComparisonResult:
     """Plain (unwarmed) QAOA, in the same `WarmStartComparisonResult` shape
-    as `run_egger_ws`/`nd_aws_to_comparison_result`
-    -- the baseline for the comparison."""
+    as `run_egger_ws` -- the baseline for the comparison."""
     ansatz, H = build_qaoa_circuit_for_instance(instance, p=p)
     best, _all = run_qaoa_multi_restart(
         ansatz,
@@ -280,83 +276,6 @@ def run_egger_ws(
             "magnetization": m,
             "rounded_bits": rounded_bits,
             "eps": eps if variant == "rounded" else None,
-        },
-    )
-
-
-def nd_aws_to_comparison_result(
-    instance,
-    p: int = 1,
-    ndaws_kwargs: Optional[dict] = None,
-) -> WarmStartComparisonResult:
-    """Adapter: run ND-AWS and repackage into `WarmStartComparisonResult`.
-    Only `variant="ND"` is supported."""
-    ndaws_kwargs = dict(ndaws_kwargs or {})
-    variant = ndaws_kwargs.pop("variant", "ND")
-    if variant != "ND":
-        raise NotImplementedError(
-            "nd_aws_to_comparison_result only supports variant='ND' -- see "
-            "this function's docstring for why variant='standard' cannot be "
-            "faithfully reconstructed from a single NDAWSIterationRecord. "
-            "Call nd_aws.run_nd_aws(..., variant='standard') directly instead."
-        )
-
-    result = run_nd_aws(instance, p=p, variant="ND", **ndaws_kwargs)
-
-    accepted = [rec for rec in result.history if rec.accepted]
-    if not accepted:
-        raise RuntimeError(
-            "run_nd_aws produced no accepted iterations -- cannot reconstruct a final ansatz."
-        )
-    winning = accepted[-1]
-    idx = winning.c_tried.index(winning.chosen_c)
-    winning_params = np.asarray(winning.optimal_params_tried[idx], dtype=float)
-    gauge_y = winning.gauge_y
-
-    J, h, boundary = instance.as_tuple()
-    n = instance.n_spins
-    zeros: Tuple[int, ...] = tuple(0 for _ in range(n))
-
-    if gauge_y != zeros:
-        J_frame, h_frame = gauge_transform(J, h, gauge_y, boundary=boundary, n_spins=n)
-    else:
-        J_frame, h_frame = J, h
-
-    H_frame = build_ising_hamiltonian(J_frame, h_frame, boundary)
-    ansatz = build_ws_ansatz(H_frame, winning.chosen_c, p=p, n_spins=n)
-
-    # <H_frame> at the winning params == physical <H_original> exactly
-    # (trace identity, Eqs. A19-A20's expectation-value form).
-    estimator = StatevectorEstimator()
-    optimal_energy = float(
-        estimator.run([(ansatz, H_frame, winning_params)]).result()[0].data.evs
-    )
-
-    sv_gauge = _bind_and_get_statevector(ansatz, winning_params)
-    if gauge_y != zeros:
-        y_int = bits_to_int(np.asarray(gauge_y))
-        dim = 2 ** n
-        sv_physical = sv_gauge[np.arange(dim) ^ y_int]
-    else:
-        sv_physical = sv_gauge
-
-    H_original = build_ising_hamiltonian(J, h, boundary)
-
-    return WarmStartComparisonResult(
-        method="nd_aws",
-        instance_name=getattr(instance, "name", "unknown"),
-        p=p,
-        optimal_params=winning_params,
-        optimal_energy=optimal_energy,
-        statevector=sv_physical,
-        ansatz=ansatz,
-        cost_hamiltonian=H_original,
-        extra={
-            "sampled_best_bits": result.best_bits,
-            "sampled_best_energy": result.best_energy,
-            "n_iterations": result.n_iterations,
-            "termination_reason": result.termination_reason,
-            "gauge_y": gauge_y,
         },
     )
 

@@ -11,8 +11,8 @@ against the exact ground-state energy `E_0`
 `run_depth_sweep` returns a `list[SweepRecord]`, one per (instance, p,
 optimizer_method) combination.
 
-Part B -- warm-start comparison: runs standard QAOA against Egger-WS and
-ND-AWS on the uniform AFM ring (`ising_model.generate_uniform_AFM_ring`),
+Part B -- warm-start comparison: runs standard QAOA against Egger-WS on the
+uniform AFM ring (`ising_model.generate_uniform_AFM_ring`),
 emitting one CSV row per `(n, p, method)`. `run_warm_start_comparison_point`
 builds one row, `run_warm_start_comparison` sweeps `(n, p)`, and
 `write_warm_start_comparison_csv` writes the result.
@@ -261,14 +261,14 @@ def records_to_dicts(records: Iterable[SweepRecord]) -> List[dict]:
 
 
 # --------------------------------------------------------------------------
-# Warm-start comparison runner (standard QAOA vs. Egger-WS vs. ND-AWS)
+# Warm-start comparison runner (standard QAOA vs. Egger-WS)
 # --------------------------------------------------------------------------
 #
-# Compares `src.warm_start.egger_ws.run_standard_qaoa` / `run_egger_ws` /
-# `nd_aws_to_comparison_result` head-to-head on the uniform AFM
-# ring (`ising_model.generate_uniform_AFM_ring`), emitting one CSV row per (n, p).
+# Compares `src.warm_start.egger_ws.run_standard_qaoa` / `run_egger_ws`
+# head-to-head on the uniform AFM ring
+# (`ising_model.generate_uniform_AFM_ring`), emitting one CSV row per (n, p).
 
-VALID_WS_METHODS = ("standard", "egger_continuous", "egger_rounded", "nd_aws")
+VALID_WS_METHODS = ("standard", "egger_continuous", "egger_rounded")
 
 WS_CSV_COLUMNS = (
     ["n", "p", "topology", "E_gs", "E_sim", "delta_E", "P_gs"]
@@ -302,19 +302,6 @@ class _CountingEstimator:
         return self._inner.run(*args, **kwargs)
 
 
-class _CountingSampler:
-    """Same wrapping pattern as `_CountingEstimator`, for `Sampler`
-    primitives (ND-AWS's bitstring-sampling step, `nd_aws.sample_bitstrings`)."""
-
-    def __init__(self, inner, counter: _CircuitCallCounter) -> None:
-        self._inner = inner
-        self._counter = counter
-
-    def run(self, *args, **kwargs):
-        self._counter.n_calls += 1
-        return self._inner.run(*args, **kwargs)
-
-
 def _run_ws_method(
     method: str,
     instance: IsingInstance,
@@ -327,17 +314,14 @@ def _run_ws_method(
     egger_variant: str,
     egger_eps: float,
     egger_relaxation_kwargs: Optional[dict],
-    ndaws_kwargs: Optional[dict],
 ):
-    """Dispatches to one of the three `warm_start.egger_ws` methods.
+    """Dispatches to one of the `warm_start.egger_ws` methods.
     Returns `(result, n_circuit_evals, notes)`."""
     from src.warm_start.egger_ws import (
         VALID_EGGER_VARIANTS,
-        nd_aws_to_comparison_result,
         run_egger_ws,
         run_standard_qaoa,
     )
-    from src.warm_start.nd_aws import build_default_sampler
 
     notes: Dict[str, str] = {}
     counter = _CircuitCallCounter()
@@ -374,23 +358,6 @@ def _run_ws_method(
             seed=seed,
             estimator=estimator,
         )
-    elif method == "nd_aws":
-        kwargs = dict(ndaws_kwargs or {})
-        kwargs.setdefault("seed", seed)
-        kwargs.setdefault("device", device)
-        ndaws_device = kwargs["device"]
-
-        sampler_counter = _CircuitCallCounter()
-        # An explicitly supplied sampler still wins,
-        # otherwise default to the one matching the requested device.
-        inner_sampler = kwargs.get("sampler") or build_default_sampler(ndaws_device)
-        kwargs["sampler"] = _CountingSampler(inner_sampler, sampler_counter)
-        kwargs["estimator"] = _CountingEstimator(
-            optimizer_module.build_estimator(ndaws_device), counter
-        )
-
-        result = nd_aws_to_comparison_result(instance, p=p, ndaws_kwargs=kwargs)
-        counter.n_calls += sampler_counter.n_calls
     else:
         raise ValueError(f"method must be one of {VALID_WS_METHODS}, got {method!r}")
 
@@ -411,7 +378,6 @@ def run_warm_start_comparison_point(
     egger_variant: str = "continuous",
     egger_eps: float = 0.1,
     egger_relaxation_kwargs: Optional[dict] = None,
-    ndaws_kwargs: Optional[dict] = None,
     assert_energy_correlator_identity: bool = True,
 ) -> dict:
     """One (n, p, method) CSV row on the uniform AFM ring; `method` in
@@ -441,7 +407,6 @@ def run_warm_start_comparison_point(
         egger_variant,
         egger_eps,
         egger_relaxation_kwargs,
-        ndaws_kwargs,
     )
     wall_time_s = time.time() - t0
 

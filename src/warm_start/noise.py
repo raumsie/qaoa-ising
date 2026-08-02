@@ -2,25 +2,19 @@
 noise.py
 ========
 
-Amplitude-damping noise model used to demonstrate ND-AWS's noise-adaptivity
-mechanism (Sec. II E / Fig. 2 of ND-AWS).
+Amplitude-damping noise model plus `optimize_qaoa_noisy`, a wrapper
+over `optimizer.py`'s `estimator` injection hook, for running QAOA under
+simulated dissipative noise.
 
-Method: ND-AWS, Eq. (10).
-F. B. Maciejewski, S. Hadfield, O. Wallis, G. Pennington, S. Brandhofer,
-S. Woerner, D. J. Egger, D. Venturelli, "Quantum Approximate Optimization
-via Noise-Directed Adaptive Warm-Starting," arXiv:2607.09368 (2026).
+Originally written to demonstrate the noise-adaptivity mechanism of ND-AWS
+(arXiv:2607.09368, Sec. II E / Fig. 2, Eq. 10), which has since been removed.
+The noise model itself is independent of that method and is kept as a general-purpose tool.
 
-Independent reimplementation written directly from the paper. Not derived
-from quapopt, the ND-AWS authors' reference implementation:
-https://github.com/usra-riacs/quantum-approximate-optimization
-
-Eq. (10): single-qubit Kraus operators
+Single-qubit Kraus operators
 
     K_0 = |0><0| + sqrt(1-q) |1><1|,   K_1 = sqrt(q) |0><1|
 
-applied uncorrelated and identical after EVERY gate in the circuit (the
-paper sweeps q in {0.01, 0.02, 0.03, 0.04, 0.05, 0.1}; this repo's tests use
-a subset of that same grid at n=4-8 qubits rather than n=20/100). Because
+applied uncorrelated and identical after EVERY gate in the circuit. Because
 amplitude damping is a non-unitary (dissipative) channel, it requires a
 density-matrix (or equivalent) simulation method -- NOT the pure-state
 `method="statevector"` used elsewhere in this repo's `optimizer.py`.

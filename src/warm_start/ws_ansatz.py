@@ -2,20 +2,17 @@
 ws_ansatz.py
 ============
 
-Warm-Start QAOA (WS-QAOA) initial state, mixer, and bitstring-derived bias,
-generalized as in ND-AWS.
+Warm-Start QAOA (WS-QAOA) initial state, mixer, and bitstring-derived bias.
 
 Methods implemented:
-- WS-QAOA initial state / mixer (Eq. 6-7 of ND-AWS; originally Eq. A5-A8 of
-  Egger, Marecek, Woerner, "Warm-starting quantum optimization," Quantum 5,
-  479 (2021), arXiv:2009.10095).
-- Bias-from-bitstring generalization (Eqs. A9-A11 of ND-AWS):
-  F. B. Maciejewski, et al., "Quantum Approximate Optimization
-  via Noise-Directed Adaptive Warm-Starting," arXiv:2607.09368 (2026).
+- WS-QAOA initial state / mixer (Eq. A5-A8 of Egger, Marecek, Woerner,
+  "Warm-starting quantum optimization," Quantum 5, 479 (2021),
+  arXiv:2009.10095; the Eq. 6-7 numbering used in the comments below
+  follows the restatement in arXiv:2607.09368).
+- The bias-from-bitstring generalization, which sets a per-qubit bias from
+  a reference bitstring rather than `c`.
 
-Independent reimplementation written directly from the papers. Not derived
-from quapopt, the ND-AWS authors' reference implementation:
-https://github.com/usra-riacs/quantum-approximate-optimization
+Independent reimplementation written directly from the papers.
 
 Built on top of `qaoa_circuit.build_qaoa_circuit`'s `mixer_operator` and
 `initial_state` parameters.
